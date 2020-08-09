@@ -1,0 +1,521 @@
+---
+title: "Market Analysis of Bird-Based Tourism Using ebird Database"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE, warning = F)
+knitr::opts_knit$set(root.dir = "D:/ebird/data/birding_market/")
+```
+####eBird is an online database of bird observation trips (checklists) providing scientists and naturalists with information about bird distribution and abundance.
+
+###Questions:
+###1. Which metric can we use to measure the popularity of bird watching in different counties?
+###2. How can we design successful birding tours?
+###3. What demographic/ economic factors contribute to the popularity of bird watching?
+
+```{r lib, message=F}
+# Import libraries. Read files.
+library(auk)
+library(tidycensus)
+library(tidyverse)
+library(readxl)
+library(urbnmapr)
+library(gridExtra)
+library(ggplot2)
+library(corrplot)
+library(modelr)
+library(ranger)
+library(gbm)
+library(caret)
+library(pdp)
+library(lubridate)
+library(ggmap)
+library(gridExtra)
+```
+
+###1. Which metric can we use to measure the popularity of bird watching in different counties?
+####1.1 Get the dataset
+```{r,eval = FALSE}
+#read and filter checklists for 2018-2020 https://ebird.org/science/download-ebird-data-products
+checklists_filters <- auk_sampling('F:/ebd_sampling_relMar-2020/ebd_sampling_relMar-2020.txt', sep = "\t") %>% 
+                      auk_date(date = c("2018-01-01", "2019-12-31")) %>% auk_country("United States") %>% auk_filter(file = 'filtered_checklist.txt')
+checklists_raw <- read_sampling(checklists_filters,unique = TRUE)
+
+checklists_raw <- checklists_raw %>% 
+  select(checklist_id,state,county,county_code,observation_date,time_observations_started)
+ 
+#get county level population, gender, age, race, citizen, income from US Census Bureau  https://www.census.gov/data/developers/data-sets/ACS-supplemental-data.html
+census_raw <- get_acs(geography = "county", 
+              variables = c(population = "B01003_001", male='B01001_002',female='B01001_026',median_age='B01002_001',
+                            white='B02001_002',black='B02001_003',native='B02001_004',asian='B02001_005',pacific='B02001_006'                                                           ,nonecitizen='B05001_006',incomepercapita='B19301_001'), 
+                            year = 2018, output = "wide") %>% select(-ends_with("M"))
+
+```
+
+```{r, include=FALSE}
+checklists_raw <- readRDS("D:/ebird/data/birding_market/import_rawdata/checklists_raw.rds")
+census_raw <- readRDS("D:/ebird/data/birding_market/import_rawdata/census_raw.rds")
+```
+
+
+####1.2 Data cleaning, preprocessing
+```{r}
+checklist_county_num <- checklists_raw %>% 
+  group_by(state,county,county_code) %>% count(name='checklist_n') %>% ungroup() %>%  drop_na()
+
+#Feature transformation
+census_raw <- census_raw %>% 
+  mutate(male=maleE/populationE, female=femaleE/populationE, white=whiteE/populationE,     black=blackE/populationE,native=nativeE/populationE,asian=asianE/populationE, pacific=pacificE/populationE,otherrace=1-white-black-native-asian-pacific,citizen=1-nonecitizenE/populationE) %>% 
+  select(-(maleE:femaleE),-(whiteE:nonecitizenE))
+
+#Employment statistics from Department of Labor, Education level from USDA
+unemployment_raw <- read_xlsx('D:/ebird/data/birding_market/bls_laucnty18_labor.xlsx') %>% 
+  unite("FIPS", c('State FIPS','county FIPS'),sep = '') %>%
+  mutate(unemployment_p=`Unemployment rate(%)`) %>% 
+  select(-'Unemployment rate(%)')
+
+#https://www.ers.usda.gov/data-products/county-level-data-sets/
+education_raw <- read_xls('D:/ebird/data/birding_market/Education_USDA.xls') %>% 
+  mutate(FIPS=`FIPS Code`) %>% select(-`FIPS Code`)
+
+census_raw <- census_raw %>% 
+  inner_join(unemployment_raw,by = c("GEOID" = "FIPS")) %>% 
+  inner_join(education_raw,by = c("GEOID" = "FIPS")) %>%
+  mutate(county_fips=substr(GEOID, start = 3, stop = 5)) %>%
+  separate(NAME,c(NA,'state'),sep=', ') %>%
+            select(-c(County,'Area name'))
+
+#https://github.com/birderboone/birderboone.github.io/blob/master/ebirdSpeciesModeled.csv
+species_n <- read.csv('D:/ebird/data/birding_market/ebirdSpecies.csv')
+
+checklist_county_num <- checklist_county_num %>% separate(county_code,c(NA,NA,'county_fips'),sep='-')
+
+census_ebird_raw <- left_join(checklist_county_num,census_raw, by=c("state",'county_fips')) %>%
+  mutate(county=tolower(county)) %>%
+  left_join(species_n, by=c('State'='state','county'))
+```
+
+
+```{r 10, warning=F, message=F, echo=FALSE,cache=TRUE}
+# Separating polyname into region and subregion
+counties_fips <- maps::county.fips %>%
+  separate(polyname, c("region","subregion"),',', FALSE) %>%
+  separate(subregion, c('subregion','subsubregion'),':') %>%
+  select(-subsubregion) %>%
+  (function(df){df[!duplicated(df$fips), ]}) %>%
+  mutate(fips = as.character(fips))
+
+#draw the map shows the checklist number for each county
+counties_sf <- get_urbn_map(map = "counties", sf = TRUE) %>% 
+  separate('county_fips',c(NA,'county_fips'),sep=-3) %>%
+  left_join(checklist_county_num, by = c("state_name"='state','county_fips')) %>%
+  left_join(census_ebird_raw %>% 
+              select(state,county_fips,populationE), by = c("state_name"='state','county_fips'))
+
+counties_sf %>%
+  ggplot() +
+  geom_sf(mapping = aes(fill = log(checklist_n)),
+          color = NA, size = 0.05) +
+  labs(fill = "Log(Checklist number)")
+
+```
+```{r, message=F}
+ggplot(census_ebird_raw %>% drop_na(), aes(x=log(populationE), y=log(checklist_n))) + 
+  geom_point(shape=18, color="brown1")+
+  geom_smooth(method=lm)+
+  labs(title="Relationship between population 
+       and checklist numbers in each county",
+       x="Log(population)", y = "Log(checklist numbers)")+
+  theme(plot.title = element_text(hjust = 0.5),text = element_text(size=15))
+```
+
+```{r, message=F}
+ggplot(census_ebird_raw, aes(x=populationE)) + 
+  geom_histogram()+
+  xlim(0, 10000)+
+  ylab("County count")+
+  xlab("Population")
+
+census_ebird_filtered <- census_ebird_raw %>% 
+  filter(populationE>=2000)
+```
+
+
+####1.3 Use checklists per person as a measurement for the popularity of bird watching in each county
+```{r}
+census_ebird_filtered <- census_ebird_filtered %>% 
+  mutate(checklist_pps=checklist_n/populationE) 
+
+counties_sf %>% left_join(census_ebird_filtered %>% 
+                            select(state,county_fips,checklist_pps), by = c("state_name"='state','county_fips')) %>%
+  ggplot() +
+  geom_sf(mapping = aes(fill = log(checklist_pps)),
+          color = NA, size = 0.05) +
+  labs(fill = "log(Checklist number per person)")
+
+```
+
+
+###2. Where should we start the business and how to design a successful product?
+####2.1 Select the candidate county
+```{r}
+census_ebird_filtered_des <- readRDS("D:/ebird/data/birding_market/import_rawdata/census_ebird_filtered.rds")
+census_ebird_filtered_des <- census_ebird_filtered_des %>% filter(populationE>=10000) %>%   #Population more than 10000
+  select(state,county,checklist_n,populationE,totalSpSeen,checklist_pps) %>%
+  arrange(desc(checklist_pps))
+census_ebird_filtered_des
+```
+
+####2.2 Read the checklist information from Arizona Santa Cruz county
+```{r,eval = FALSE}
+checklists_sc <- checklists_raw %>% 
+  filter(state=='Arizona',county=='Santa Cruz') %>% 
+  select("checklist_id","observation_date","time_observations_started","duration_minutes", "effort_distance_km",'latitude','longitude') %>% 
+  distinct() 
+```
+
+```{r, include=FALSE}
+checklists_sc <- readRDS("D:/ebird/data/birding_market/import_rawdata/checklists_sc.rds")
+```
+
+```{r}
+#Convert hh:mm:ss to decimal time
+time_to_decimal <- function(x) {
+  x <- hms(x, quiet = TRUE)
+  hour(x) + minute(x) / 60 + second(x) / 3600
+}
+
+checklists_sc <- checklists_sc %>% 
+  mutate(time_observations_started = time_to_decimal(time_observations_started),
+  day_of_year = yday(observation_date), month_of_year=month(observation_date), weekday=wday(observation_date)) %>% 
+  drop_na()
+```
+
+####2.3 People's favorite months and days for bird watching
+```{r}
+# summarize data by hourly bins
+month_n <- checklists_sc %>% 
+  group_by(month_of_year) %>% 
+  summarise(n_checklists = n())
+
+month_fig <- ggplot(month_n) +
+  aes(x = month_of_year, y = n_checklists) +
+  geom_line() +
+  geom_point() +
+  labs(x = "Month",
+       y = "Checklists number (n)",
+       title = "Checklists number for each month") +
+  scale_x_continuous(breaks = 1:12,labels = c('January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'))+
+  theme(axis.text.x = element_text(angle = 30))
+  
+weekday_n <- checklists_sc %>% 
+  group_by(weekday) %>% 
+  summarise(n_checklists = n()) %>%
+  ungroup() %>%
+  mutate(weekday=weekday-1) %>%
+  mutate(weekday=ifelse(weekday==0, 7,weekday))
+
+weekday_fig <- ggplot(weekday_n) +
+  aes(x = weekday, y = n_checklists) +
+  geom_line() +
+  geom_point() +
+  labs(y = "Checklists number (n)",
+       title = "Checklists number for each day") +
+  scale_x_continuous(breaks = 1:7,labels=c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")) +
+    theme(axis.text.x = element_text(angle = 30))
+
+# combine
+grid.arrange(month_fig, weekday_fig, nrow=1)
+```
+```{r, message=F}
+#Latitude and longitude of sf found through https://www.latlong.net/
+sc_map <- get_stamenmap(bbox = c(left = -111.363808, top=31.727364, bottom=31.331352, right=-110.448482), zoom = 10)
+
+checklist_spring <- checklists_sc %>% filter(month_of_year%in%c(3,4,5))
+
+map_spring <- ggmap(sc_map) +
+  #contour
+  geom_density2d(data = checklist_spring, aes(x = longitude, y = latitude), size = 0.3)+ 
+  #fill in the color according to density
+  stat_density2d(data = checklist_spring, aes(x = longitude, y = latitude, fill = ..level.., alpha = ..level..), geom = "polygon") + 
+  scale_fill_gradient(low = "green", high = "red") +
+  scale_alpha(range = c(0.1, 1), guide = FALSE)+
+  theme(plot.title = element_text(size = 14, face = "bold"))+
+  labs(title = "Density of checklists in spring")
+
+checklist_fall <- checklists_sc %>% filter(month_of_year%in%c(7,8,9))
+
+map_fall <- ggmap(sc_map) +
+  #contour
+  geom_density2d(data = checklist_fall, aes(x = longitude, y = latitude), size = 0.3)+ 
+  #fill in the color according to density
+  stat_density2d(data = checklist_fall, aes(x = longitude, y = latitude, fill = ..level.., alpha = ..level..), geom = "polygon") + 
+  scale_fill_gradient(low = "green", high = "red") +
+  scale_alpha(range = c(0.1, 1), guide = FALSE) +
+  theme(plot.title = element_text(size = 14, face = "bold"))+
+  labs(title = "Density of checklists in fall" )
+
+grid.arrange(map_spring, map_fall, nrow=1)
+```
+
+####2.4 People's preference for start time and trip duration
+```{r}
+breaks <- 0:24
+labels <- breaks[-length(breaks)] + diff(breaks) / 2
+starttime_n <- checklists_sc %>% 
+  mutate(startt = cut(time_observations_started, 
+                         breaks = breaks, 
+                        labels = labels,
+                         include.lowest = TRUE),
+         startt = as.numeric(as.character(startt))) %>% 
+  group_by(startt) %>% 
+  drop_na() %>% 
+  summarise(n_checklists = n())
+
+starttime_fig <- ggplot(starttime_n) +
+  aes(x = startt, y = n_checklists) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 0:24, limits = c(0, 24)) +
+  labs(x = "Hours since midnight",
+       y = "Checklists number (n)",
+       title = "Bird watching start times")+
+  theme(axis.text.x = element_text(angle = 45))
+
+
+breaks <- 0:24
+labels <- 1:24
+duration_n <- checklists_sc %>%
+  mutate(duration_h=duration_minutes/36) %>%
+  filter(duration_h<=24) %>%
+  mutate(duration = cut(duration_h, 
+                        breaks = breaks, 
+                        label = labels,
+                        include.lowest = TRUE),
+         duration = as.numeric(as.character(duration))) %>% 
+  drop_na() %>% 
+  group_by(duration) %>% 
+  summarise(n_checklists = n())
+
+# histogram
+duration_fig <- ggplot(duration_n) +
+  aes(x = duration, y = n_checklists) +
+  geom_col(width = mean(diff(breaks)), color = "grey30", fill = "grey50") +
+  scale_x_continuous(breaks = 1:24) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Duration (h)",
+       y = "Checklists number (n)",
+       title = "Bird watching durations distribution")+
+  theme(axis.text.x = element_text(angle = 45))
+
+# combine
+grid.arrange(starttime_fig, duration_fig, nrow=1)
+```
+
+###3. Which demographic/ economic factors contribute to the popularity of bird watching? The demographic features for our potential customers (The demographic features of ebird users are not provided by the database).
+####3.1 The Pearson correlation between checklist number per person and other features
+```{r}
+census_ebird_filtered <- census_ebird_filtered %>% 
+  select(-c('county','State',"state","county_fips","checklist_n","GEOID","populationE","male","otherrace","Lesshighschool_p","highschool_p",  "college_p","checklists","modeledTotal","speciesDifference" )) %>% 
+  filter(checklist_pps<=1) %>% 
+  drop_na()
+
+feature_cor=cor(census_ebird_filtered, method = "pearson")
+corrplot(feature_cor, type="upper")
+```
+
+
+####3.2 Use linear regression to predict the popularity of bird watching in each county.
+```{r}
+normalize <- function(x) { return ((x - min(x)) / (max(x) - min(x)))}
+census_ebird_nor <- census_ebird_filtered %>% mutate_at(vars(median_ageE:totalSpSeen), normalize)
+
+#Use 80% samples to fit the model, use another 20% to test the model
+set.seed(1) 
+in.trn <- sample.int(nrow(census_ebird_nor), 0.8*nrow(census_ebird_nor)) 
+census_ebird_nor_trn <- census_ebird_nor[ in.trn,]
+census_ebird_nor_tst <- census_ebird_nor[-in.trn,]
+
+linearMod <- lm(checklist_pps ~ ., data=census_ebird_nor_trn)  
+
+linear_coeff <- as.data.frame(sort(linearMod$coefficients[-1]))
+colnames(linear_coeff) <- 'coeff'
+linear_coeff$feature <- rownames(linear_coeff)
+
+ggplot(data=linear_coeff, aes(x=reorder(row.names(linear_coeff),coeff), y=coeff))+
+  geom_bar(stat="identity")+
+  theme(axis.text.x = element_text(angle = 30))+
+  ylab("Linear coefficient")+
+  xlab("Features")
+
+error=matrix(0,nrow=2,ncol=2, dimnames = list(c('linear','GBM'), c('training error','test error')))
+error[1,1]=sqrt(sum((linearMod$residuals)^2)/length(linearMod$residuals))
+
+```
+
+```{r}
+tstPred <- predict(linearMod, census_ebird_nor_tst)
+
+linearMod_result <- as.data.frame(cbind(actuals=census_ebird_nor_tst$checklist_pps, predicteds=tstPred))
+
+rmse_linear <- sqrt(mean((linearMod_result$actuals - linearMod_result$predicteds)^2))
+error[1,2]=rmse_linear
+sprintf('The RMSE for linear model on test data is %f',rmse_linear)
+```
+
+
+####3.3 Use Gradient Boosting Machine to predict the popularity of bird watching in each county. Find the optimized parameters
+```{r}
+set.seed(66)
+# train GBM model, find the range of iteration
+gbm.fit <- gbm(
+  formula = checklist_pps ~ .,
+  distribution = "gaussian",
+  data = census_ebird_nor_trn,
+  n.trees = 10000,  #total number of train
+  interaction.depth = 3,  #tree height, determine the number of splits
+  shrinkage = 0.01,   #Learning rate
+  cv.folds = 5,     #5 fold cross validation
+  n.cores = NULL, 
+  verbose = FALSE  #don't print progress and performance indicators
+  )  
+gbm.perf(gbm.fit, plot.it = FALSE,method = "cv")
+```
+
+```{r}
+hyper_grid <- expand.grid(
+  shrinkage = c(.005,0.01, .1),
+  interaction.depth = c(1,5,10),
+  n.minobsinnode = c(5, 10, 15),   # minimum number of observations in tree terminal nodes
+  bag.fraction = c(0.65,0.8,0.9), 
+  optimal_trees = 0,               # a place to dump results
+  min_RMSE = 0                     # a place to dump results
+)
+
+
+# grid search 
+for(i in 1:nrow(hyper_grid)) {
+  
+  set.seed(66)
+  
+  gbm.tune <- gbm(
+    formula = checklist_pps ~ .,
+    distribution = "gaussian",
+    data = census_ebird_nor_trn,
+    n.trees = 2000,
+    interaction.depth = hyper_grid$interaction.depth[i],
+    shrinkage = hyper_grid$shrinkage[i],
+    n.minobsinnode = hyper_grid$n.minobsinnode[i],
+    bag.fraction = hyper_grid$bag.fraction[i],
+    train.fraction = .75,
+    n.cores = NULL, 
+    verbose = FALSE
+  )
+  
+  hyper_grid$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+  hyper_grid$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+
+hyper_grid %>% 
+  dplyr::arrange(min_RMSE) %>%
+  head(10)
+```
+
+####3.4 Train the final GBM model, identify the most relevant variables
+```{r}
+set.seed(66)
+# train GBM model
+gbm.fit.final <- gbm(
+  formula = checklist_pps ~ .,
+  distribution = "gaussian",
+  data = census_ebird_nor_trn,
+  n.trees = 1136,
+  interaction.depth = 10,
+  shrinkage = 0.01,
+  n.minobsinnode = 5,
+  bag.fraction = .65, 
+  train.fraction = .75,
+  n.cores = NULL, 
+  verbose = FALSE
+  )  
+
+par(mar = c(5, 8, 1, 1))
+summary(
+  gbm.fit.final, 
+  cBars = 10,
+  method = relative.influence, # also can use permutation.test.gbm
+  las = 2
+  )
+
+error[2,1] <- sqrt(sum((gbm.fit.final$fit-census_ebird_nor_trn$checklist_pps)^2)/length(census_ebird_nor_trn$checklist_pps))
+```
+
+```{r}
+fig1=gbm.fit.final %>%
+  partial(
+    pred.var = "median_ageE", 
+    n.trees = gbm.fit.final$n.trees, 
+    grid.resolution = 100
+    ) %>%
+  autoplot(rug = TRUE, train = census_ebird_nor_trn)
+
+fig2=gbm.fit.final %>%
+  partial(
+    pred.var = "totalSpSeen", 
+    n.trees = gbm.fit.final$n.trees, 
+    grid.resolution = 100
+    ) %>%
+  autoplot(rug = TRUE, train = census_ebird_nor_trn)
+
+fig3=gbm.fit.final %>%
+  partial(
+    pred.var = "black", 
+    n.trees = gbm.fit.final$n.trees, 
+    grid.resolution = 100
+    ) %>%
+  autoplot(rug = TRUE, train = census_ebird_nor_trn)
+
+fig4=gbm.fit.final %>%
+  partial(
+    pred.var = "female", 
+    n.trees = gbm.fit.final$n.trees, 
+    grid.resolution = 100
+    ) %>%
+  autoplot(rug = TRUE, train = census_ebird_nor_trn)
+
+fig5=gbm.fit.final %>%
+  partial(
+    pred.var = "bachelorhigher_p", 
+    n.trees = gbm.fit.final$n.trees, 
+    grid.resolution = 100
+    ) %>%
+  autoplot(rug = TRUE, train = census_ebird_nor_trn)
+
+grid.arrange(fig1, fig2,fig3,fig4,fig5, top="Partial dependence plots for the top 5 relevant variables")
+```
+
+####3.5 Test the final GBM model on test data
+```{r, message=F}
+gbm_pred <- predict(gbm.fit.final, n.trees = gbm.fit.final$n.trees, census_ebird_nor_tst)
+error[2,2]=RMSE(gbm_pred, census_ebird_nor_tst$checklist_pps)
+
+gbmMod_result <- as.data.frame(cbind(actuals=census_ebird_nor_tst$checklist_pps, predicteds=gbm_pred))
+
+ggplot(gbmMod_result,aes(x=actuals, y=predicteds)) + 
+  geom_point(shape=18, color="brown1")+
+  geom_smooth(method=lm)+
+  labs(title="Relationship between predicted results and actual results",
+       x="actual results", y = "predicted results")+
+  theme(plot.title = element_text(hjust = 0.5),text = element_text(size=15))
+
+print(error)
+```
+
+###Conclusions:
+###1. Checklist number per person is a good metric for measuring popularity of bird watching.
+###2. Santa Cruz, AZ is a potential place to start the business. People prefer 1-3 hours trips in Spring on Saturday.
+###3. Our potential customers are more likely to be older man with higher education level.

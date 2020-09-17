@@ -1,5 +1,5 @@
 # Bird watching market analysis
 
-Analysis of bird watching popularity in differnt US counties and the contributing factors.
+Analysis of bird watching popularity in different US counties and the contributing factors.
 
 Main data source: ebird
